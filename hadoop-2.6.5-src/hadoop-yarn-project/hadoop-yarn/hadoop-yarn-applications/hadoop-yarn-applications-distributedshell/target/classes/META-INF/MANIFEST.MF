@@ -1,0 +1,6 @@
+Manifest-Version: 1.0
+Built-By: Administrator
+Build-Jdk: 1.8.0_102
+Main-Class: org.apache.hadoop.yarn.applications.distributedshell.Client
+Created-By: Maven Integration for Eclipse
+
