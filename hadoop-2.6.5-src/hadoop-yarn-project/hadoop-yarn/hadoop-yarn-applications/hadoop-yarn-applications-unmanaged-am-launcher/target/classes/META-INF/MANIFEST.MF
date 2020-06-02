@@ -1,7 +1,0 @@
-Manifest-Version: 1.0
-Built-By: Administrator
-Build-Jdk: 1.8.0_102
-Main-Class: org.apache.hadoop.yarn.applications.unmanagedamlauncher.Un
- managedAMLauncher
-Created-By: Maven Integration for Eclipse
-
