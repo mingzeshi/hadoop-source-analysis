@@ -70,7 +70,7 @@ public class SerializationFactory extends Configured {
       Class<? extends Serialization> serializionClass =
         (Class<? extends Serialization>) conf.getClassByName(serializationName);
       serializations.add((Serialization)
-      ReflectionUtils.newInstance(serializionClass, getConf()));
+      ReflectionUtils.newInstance(serializionClass, getConf())); // 实例化序列化类，并加入到集合中，List<Serialization<?>> serializations
     } catch (ClassNotFoundException e) {
       LOG.warn("Serialization class not found: ", e);
     }

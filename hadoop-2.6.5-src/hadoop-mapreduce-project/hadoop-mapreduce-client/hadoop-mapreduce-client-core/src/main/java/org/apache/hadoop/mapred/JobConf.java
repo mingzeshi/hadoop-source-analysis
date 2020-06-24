@@ -809,6 +809,9 @@ public class JobConf extends Configuration {
    *  
    * @return the map output key class.
    */
+  /**
+   * 拿到map_output_key的class类型，是我们在代码中设置的，如果不设置，去获取output_key的class类型
+   */
   public Class<?> getMapOutputKeyClass() {
     Class<?> retv = getClass(JobContext.MAP_OUTPUT_KEY_CLASS, null, Object.class);
     if (retv == null) {
@@ -834,6 +837,9 @@ public class JobConf extends Configuration {
    * different than the final output value class.
    *  
    * @return the map output value class.
+   */
+  /**
+   * 拿到map_output_value的class类型，是我们在代码中设置的，如果不设置，去获取output_value的class类型
    */
   public Class<?> getMapOutputValueClass() {
     Class<?> retv = getClass(JobContext.MAP_OUTPUT_VALUE_CLASS, null,
@@ -881,10 +887,10 @@ public class JobConf extends Configuration {
    */
   public RawComparator getOutputKeyComparator() {
     Class<? extends RawComparator> theClass = getClass(
-      JobContext.KEY_COMPARATOR, null, RawComparator.class);
+      JobContext.KEY_COMPARATOR, null, RawComparator.class); // 获取key比较器的class类
     if (theClass != null)
-      return ReflectionUtils.newInstance(theClass, this);
-    return WritableComparator.get(getMapOutputKeyClass().asSubclass(WritableComparable.class), this);
+      return ReflectionUtils.newInstance(theClass, this); // 实例化key比较器
+    return WritableComparator.get(getMapOutputKeyClass().asSubclass(WritableComparable.class), this); // 以上创建失败，就创建这个
   }
 
   /**

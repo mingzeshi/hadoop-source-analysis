@@ -63,6 +63,10 @@ import org.apache.hadoop.classification.InterfaceStability;
  */
 @InterfaceAudience.Public
 @InterfaceStability.Stable
+/**
+ * Writable是个接口
+ * Hadoop中需要序列化的对象（包括输入输出Key，Value都必须是可序列化的）继承于Writable接口，该接口提供两个方法：读和写：
+ */
 public interface Writable {
   /** 
    * Serialize the fields of this object to <code>out</code>.

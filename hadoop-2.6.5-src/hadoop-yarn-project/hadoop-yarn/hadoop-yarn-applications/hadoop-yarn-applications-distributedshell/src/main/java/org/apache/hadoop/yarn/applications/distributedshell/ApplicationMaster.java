@@ -278,6 +278,9 @@ public class ApplicationMaster {
   /**
    * @param args Command line args
    */
+  /**
+   * ResourceManager 会为每个Applicaiton启动一个ApplicaitonMaster
+   */
   public static void main(String[] args) {
     boolean result = false;
     try {

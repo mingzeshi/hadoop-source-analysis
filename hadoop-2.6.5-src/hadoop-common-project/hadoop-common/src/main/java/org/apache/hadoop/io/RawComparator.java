@@ -34,6 +34,12 @@ import org.apache.hadoop.io.serializer.DeserializerComparator;
  */
 @InterfaceAudience.Public
 @InterfaceStability.Stable
+/**
+ * 比较器，比较字节
+ * @author Administrator
+ *
+ * @param <T>
+ */
 public interface RawComparator<T> extends Comparator<T> {
 
   /**

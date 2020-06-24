@@ -210,7 +210,7 @@ public class ApplicationClientProtocolPBServiceImpl implements ApplicationClient
       SubmitApplicationRequestProto proto) throws ServiceException {
     SubmitApplicationRequestPBImpl request = new SubmitApplicationRequestPBImpl(proto);
     try {
-      SubmitApplicationResponse response = real.submitApplication(request);
+      SubmitApplicationResponse response = real.submitApplication(request); // org.apache.hadoop.yarn.api.ApplicationClientProtocol 提交Application，并返回SubmitApplicationResponse结果对象
       return ((SubmitApplicationResponsePBImpl)response).getProto();
     } catch (YarnException e) {
       throw new ServiceException(e);

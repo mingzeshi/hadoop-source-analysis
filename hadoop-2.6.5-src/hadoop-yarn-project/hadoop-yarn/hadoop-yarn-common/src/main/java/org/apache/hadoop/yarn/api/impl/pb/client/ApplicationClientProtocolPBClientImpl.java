@@ -227,10 +227,10 @@ public class ApplicationClientProtocolPBClientImpl implements ApplicationClientP
       SubmitApplicationRequest request) throws YarnException,
       IOException {
     SubmitApplicationRequestProto requestProto =
-        ((SubmitApplicationRequestPBImpl) request).getProto();
+        ((SubmitApplicationRequestPBImpl) request).getProto(); // 拿到请求提交Application的Request对象
     try {
-      return new SubmitApplicationResponsePBImpl(proxy.submitApplication(null,
-        requestProto));
+      return new SubmitApplicationResponsePBImpl(proxy.submitApplication(null, // org.apache.hadoop.yarn.api.ApplicationClientProtocolPB 实际提交Applicaiton
+        requestProto)); // requestProto 请求对象
     } catch (ServiceException e) {
       RPCUtil.unwrapAndThrowException(e);
       return null;

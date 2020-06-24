@@ -1512,6 +1512,9 @@ abstract public class Task implements Writable, Configurable {
                          ) throws IOException, InterruptedException, 
                                   ClassNotFoundException;
 
+    /**
+     * 根据新旧API的不同，有两种实现：OldCombinerRunner、NewCombinerRunner。这两个类里面都有一个combine方法，实现KeyValue的合并
+     */
     @SuppressWarnings("unchecked")
     public static <K,V> 
     CombinerRunner<K,V> create(JobConf job,
@@ -1631,6 +1634,9 @@ abstract public class Task implements Writable, Configurable {
       }
     }
 
+    /**
+     * combine()方法是Combiner的具体实现，实质上是实例化了Reducer，调用了reduce方法，可以看出，combiner实现的就是本Map任务内的、局部的reduce。
+     */
     @SuppressWarnings("unchecked")
     @Override
     public void combine(RawKeyValueIterator iterator, 

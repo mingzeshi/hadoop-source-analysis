@@ -275,6 +275,9 @@ public class YARNRunner implements ClientProtocol {
     return resMgrDelegate.getTaskTrackerExpiryInterval();
   }
 
+  /**
+   * 向Yarn提交Application
+   */
   @Override
   public JobStatus submitJob(JobID jobId, String jobSubmitDir, Credentials ts)
   throws IOException, InterruptedException {
@@ -288,7 +291,7 @@ public class YARNRunner implements ClientProtocol {
     // Submit to ResourceManager
     try {
       ApplicationId applicationId =
-          resMgrDelegate.submitApplication(appContext);
+          resMgrDelegate.submitApplication(appContext); // resMgrDelegate 继承了YarnClient，向Yarn提交Application
 
       ApplicationReport appMaster = resMgrDelegate
           .getApplicationReport(applicationId);

@@ -29,6 +29,7 @@ import java.nio.ByteOrder;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -48,6 +49,7 @@ import org.apache.hadoop.io.RawComparator;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.SequenceFile.CompressionType;
 import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.hadoop.io.compress.DefaultCodec;
 import org.apache.hadoop.io.serializer.Deserializer;
@@ -725,10 +727,14 @@ public class MapTask extends Task {
       }
     }
 
+    /**
+     * 我们在代码中写的Context.write(key, value)，其实就是调用的这个方法
+     * 这个方法中调用了 collector.collect(key, value, partition)，是调用了MapoutputBuffer中的MapOutputCollector<K,V> collector，是将数据写入内存缓冲区，也就是shuffer的开始
+     */
     @Override
     public void write(K key, V value) throws IOException, InterruptedException {
       collector.collect(key, value,
-                        partitioner.getPartition(key, value, partitions));
+                        partitioner.getPartition(key, value, partitions)); // 将本次写入的数据路由到哪个分区，我们可以自己指定，默认使用的是 org.apache.hadoop.mapreduce.lib.partition.HashPartitioner<K, V>
     }
 
     @Override
@@ -905,47 +911,68 @@ public class MapTask extends Task {
     }
   }
 
+  /**
+   * MapReduce的默认shuffer组件
+   * 
+   * @author Administrator
+   *
+   * @param <K>
+   * @param <V>
+   */
   @InterfaceAudience.LimitedPrivate({"MapReduce"})
   @InterfaceStability.Unstable
   public static class MapOutputBuffer<K extends Object, V extends Object>
       implements MapOutputCollector<K, V>, IndexedSortable {
-    private int partitions;
-    private JobConf job;
-    private TaskReporter reporter;
-    private Class<K> keyClass;
-    private Class<V> valClass;
+    private int partitions; // 分区数量，也就是reduce-task的数量
+    private JobConf job; // job的配置项
+    private TaskReporter reporter; // 是一个子进程向父进程汇报状态的线程类，汇报接口使用umbilical RPC接口 (或) 报告器TaskReporter，它不断向ApplicationMaster报告任务的执行进度
+    private Class<K> keyClass; // key的Class类型
+    private Class<V> valClass; // value的class类型
     private RawComparator<K> comparator;
-    private SerializationFactory serializationFactory;
-    private Serializer<K> keySerializer;
-    private Serializer<V> valSerializer;
-    private CombinerRunner<K,V> combinerRunner;
-    private CombineOutputCollector<K, V> combineCollector;
+    private SerializationFactory serializationFactory; // 序列化工场
+    private Serializer<K> keySerializer; // key-class类型序列化方式
+    private Serializer<V> valSerializer; // value-class类型序列化方式
+    private CombinerRunner<K,V> combinerRunner; // 于对Map处理的输出结果进行合并处理，减少Shuffle网络开销，CombinerRunner是一个抽象类
+    private CombineOutputCollector<K, V> combineCollector; // Combine之后的输出对象 
 
     // Compression for map-outputs
-    private CompressionCodec codec;
+    private CompressionCodec codec; // map数据输出压缩方式
 
     // k/v accounting
     private IntBuffer kvmeta; // metadata overlay on backing store
-    int kvstart;            // marks origin of spill metadata // 溢写时meta数据的起始位置
-    int kvend;              // marks end of spill metadata // 溢写时meta数据的结束位置
-    int kvindex;            // marks end of fully serialized records // 下次要插入的meta信息的起始位置
+    int kvstart;            // marks origin of spill metadata // meta数据的起始位置，在溢写发生的时候它是数据的起点
+    int kvend;              // marks end of spill metadata // meta数据的结束位置，在溢写发生的时候它是数据的终点
+    int kvindex;            // marks end of fully serialized records // 下次要插入的meta信息的位置，溢写发生对它不产生影响它会断续向下写数据
 
-    int equator;            // marks origin of meta/serialization // 缓冲区的中界点，raw的key value数据和meta信息分别从中界点往两侧填充
-    int bufstart;           // marks beginning of spill // 溢写时raw数据的起始位置
-    int bufend;             // marks beginning of collectable // 溢写时raw数据的结束位置
-    int bufmark;            // marks end of record
-    int bufindex;           // marks end of collected // raw数据的结束位置
-    int bufvoid;            // marks the point where we should stop // 标记出我们应该停止的地方，也就是buffer的终点(停止的地方)
+    int equator;            // marks origin of meta/serialization // 缓冲区的中界点，key/value数据和meta信息分别从中界点往两侧填充，key/value向右写，meta向左写
+    int bufstart;           // marks beginning of spill // key/value数据的起始位置，在溢写发生的时候它是刷入磁盘数据的起点
+    int bufend;             // marks beginning of collectable // key/value数据的起始位置，在溢写发生的时候它是刷入磁盘数据的终点
+    int bufmark;            // marks end of record // bufmark表示最后写入的key/value的位置+1，其实与bufindex一样，因为bufmark就是bufindex更新过来的
+    											   /* 
+    											    * 此标记是用来处理key截断存储后将kvbuffer末尾的那段key可以移动到kvbuffer的开始头部
+                                                    * 例如：新写入的key是helloworld，hello写在了kvbuffer尾部，world写在了kvbuffer的头部，那此时，bufindex已经是d(world的d)位置+1了，
+                                                    * 那如果想拿到kvbuffer尾部的hello移动到kvbuffer头部，那就必须在得知道h(hello)的位置，所以bufmark就是干这个事的
+     											    * 他是在上一个key/value都写完了以后更新的: bufmark = bufindex，所以bufmark的位置，就是新写入key的位置
+     											    * 所以尾部的一段key数据(hello)的长度就是 bufvoid(kvbuffer的末尾) - bufmark
+     											    * 但如果value被截断存储了是不需要恢复截断的，因为key要排序，所以bufmark是在一个key/value存储完成之后才更新
+           										    */ 
+    int bufindex;           // marks end of collected // key/value下一个可以写入的位置
+    int bufvoid;            // marks the point where we should stop // bufvoid表示kvbuffer的末尾
                             // reading at the end of the buffer
 
     byte[] kvbuffer;        // main output buffer // 主要的数据输出缓冲区
     private final byte[] b0 = new byte[0];
 
+    // key value在kvbuffer中的地址存放在偏移kvindex的距离
     private static final int VALSTART = 0;         // val offset in acct
     private static final int KEYSTART = 1;         // key offset in acct
+    // partition信息存在kvmeta中偏移kvindex的距离
     private static final int PARTITION = 2;        // partition offset in acct
+    // value长度存放在偏移kvindex的距离
     private static final int VALLEN = 3;           // length of value
+    // 一对key value的meta数据在kvmeta中占用的个数
     private static final int NMETA = 4;            // num meta ints
+    // 一对key value的meta数据在kvmeta中占用的byte数
     private static final int METASIZE = NMETA * 4; // size in bytes
 
     // spill accounting
@@ -963,7 +990,7 @@ public class MapTask extends Task {
     final Condition spillReady = spillLock.newCondition();
     final BlockingBuffer bb = new BlockingBuffer();
     volatile boolean spillThreadRunning = false;
-    final SpillThread spillThread = new SpillThread();
+    final SpillThread spillThread = new SpillThread(); // 数据溢写线程
 
     private FileSystem rfs;
 
@@ -1001,10 +1028,16 @@ public class MapTask extends Task {
       partitions = job.getNumReduceTasks();
       rfs = ((LocalFileSystem)FileSystem.getLocal(job)).getRaw();
 
+      // MAP_SORT_SPILL_PERCENT = mapreduce.map.sort.spill.percent
+      // map 端buffer所占的百分比
       //sanity checks
       final float spillper =
         job.getFloat(JobContext.MAP_SORT_SPILL_PERCENT, (float)0.8); // 当数据占用超过这个比例，会造成溢写，由配置“mapreduce.map.sort.spill.percent”指定，默认值是0.8
-      final int sortmb = job.getInt(JobContext.IO_SORT_MB, 100); // kvbuffer占用的内存总量，单位是M，由配置“mapreduce.task.index.cache.limit.bytes”指定，默认值是100
+      // IO_SORT_MB = "mapreduce.task.io.sort.mb"
+      // map 端buffer大小
+      // mapreduce.task.io.sort.mb * mapreduce.map.sort.spill.percent 最好是16的整数倍
+      final int sortmb = job.getInt(JobContext.IO_SORT_MB, 100);
+      // 所有的spill index 在内存所占的大小的阈值
       indexCacheMemoryLimit = job.getInt(JobContext.INDEX_CACHE_MEMORY_LIMIT,
                                          INDEX_CACHE_MEMORY_LIMIT_DEFAULT); // 存放溢写文件信息的缓存大小，由参数“mapreduce.task.index.cache.limit.bytes”指定，单位是byte，默认值是1024*1024（1M)
       if (spillper > (float)1.0 || spillper <= (float)0.0) {
@@ -1015,13 +1048,19 @@ public class MapTask extends Task {
         throw new IOException(
             "Invalid \"" + JobContext.IO_SORT_MB + "\": " + sortmb);
       }
+      // 排序的实现类，可以自己实现。这里用的是改写的快排
       sorter = ReflectionUtils.newInstance(job.getClass("map.sort.class",
-            QuickSort.class, IndexedSorter.class), job); // 排序的类
+            QuickSort.class, IndexedSorter.class), job);
       // buffers and accounting
+      // 上面IO_SORT_MB的单位是MB，左移20位将单位转化为byte
       int maxMemUsage = sortmb << 20; // 大小 : 100 << 20 字节，就是 100M
+      // METASIZE是元数据的长度，元数据有4个int单元，分别为
+      // VALSTART、KEYSTART、PARTITION、VALLEN，而int为4个byte，
+      // 所以METASIZE长度为16。下面是计算buffer中最多有多少byte来存元数据
       maxMemUsage -= maxMemUsage % METASIZE; // maxMemUsage % 16
-      kvbuffer = new byte[maxMemUsage]; // 初始化缓冲区，存放数据
-      bufvoid = kvbuffer.length;
+      // 数据数组  以byte为单位
+      kvbuffer = new byte[maxMemUsage];
+      bufvoid = kvbuffer.length; // 104857600
       
       /**
        * ByteBuffer是一个抽象类，封装了byte数组之上的getXXX,putXXX等方法，可以把byte数组当成其他类型的数组使用。wrap方法是将byte数组与最终要返回的数组绑定起来，
@@ -1029,32 +1068,43 @@ public class MapTask extends Task {
        * 大概就是放一个long（0x0102030405060708L）进内存，再取最低位的那个byte出来，如果是“0x01",就是大端法，如果是"0x08",就是小端。asIntBuffer是个抽象方法，
        * 交给子类实现的，就不展开了。
        */
-      kvmeta = ByteBuffer.wrap(kvbuffer)
+      // 将kvbuffer转化为int型的kvmeta  以int为单位，也就是4byte
+      kvmeta = ByteBuffer.wrap(kvbuffer) // IntBuffer: java.nio.ByteBufferAsIntBufferL[pos=0 lim=26214400 cap=26214400]
          .order(ByteOrder.nativeOrder())
-         .asIntBuffer(); // 存放meta信息
+         .asIntBuffer(); // 初始化了一个和kvbuffer一样大小的IntBufer，存放meta信息
+      // 设置buf和kvmeta的分界线
       setEquator(0); // 设置equator位置是0
-      bufstart = bufend = bufindex = equator;
-      kvstart = kvend = kvindex;
+      bufstart = bufend = bufindex = equator; // bufstart 0、 bufend 0、 bufindex 0、 equator 0
+      kvstart = kvend = kvindex; // kvstart 26214396、  kvend 26214396、 kvindex 26214396
 
-      maxRec = kvmeta.capacity() / NMETA;
-      softLimit = (int)(kvbuffer.length * spillper); // 字节单位的溢写阈值，超过之后需要写磁盘，值等于sortmb*spillper
-      bufferRemaining = softLimit; // buffer剩余空间，字节为单位
+      // kvmeta中存放元数据实体的最大个数
+      maxRec = kvmeta.capacity() / NMETA; // 26214400 / 4 = 6553600
+      /**
+       * 这里需要注意的是softLimit并不是sortmb*spillper，而是kvbuffer.length * spillper，
+       * 当sortmb << 20是16的整数倍时，才可以认为softLimit是sortmb*spillper。
+       */
+      softLimit = (int)(kvbuffer.length * spillper); // 83886080 字节单位的溢写阈值，超过之后需要写磁盘，值等于sortmb*spillper 
+      // 此变量较为重要，作为spill的动态衡量标准
+      bufferRemaining = softLimit; // buffer触发溢写磁盘的剩余空间，字节为单位，
       LOG.info(JobContext.IO_SORT_MB + ": " + sortmb);
       LOG.info("soft limit at " + softLimit);
       LOG.info("bufstart = " + bufstart + "; bufvoid = " + bufvoid);
       LOG.info("kvstart = " + kvstart + "; length = " + maxRec);
 
       // k/v serialization
-      comparator = job.getOutputKeyComparator();
-      keyClass = (Class<K>)job.getMapOutputKeyClass();
-      valClass = (Class<V>)job.getMapOutputValueClass();
-      serializationFactory = new SerializationFactory(job);
-      keySerializer = serializationFactory.getSerializer(keyClass);
-      keySerializer.open(bb);
-      valSerializer = serializationFactory.getSerializer(valClass);
-      valSerializer.open(bb);
+      comparator = job.getOutputKeyComparator(); // 表示用来对Key-Value记录进行排序的自定义比较器
+      keyClass = (Class<K>)job.getMapOutputKeyClass(); // 通过job拿到keyClass，我们之前设置过的
+      valClass = (Class<V>)job.getMapOutputValueClass(); // 通过job拿到valClass，我们之前设置过的
+      serializationFactory = new SerializationFactory(job); // 初始化-数据序列化工场
+      keySerializer = serializationFactory.getSerializer(keyClass); // 从序列化工场拿到key的序列化器
+      // 将bb作为key序列化写入的output
+      keySerializer.open(bb); // 为keySerializer添加数据写入(OutputStream)，BlockingBuffer extends DataOutputStream
+      valSerializer = serializationFactory.getSerializer(valClass); // 从序列化工场拿到value的序列化器
+      // 将bb作为value序列化写入的output
+      valSerializer.open(bb); // 为valueSerializer添加数据写入(OutputStream)，BlockingBuffer extends DataOutputStream
 
-      // output counters
+      // output counters 
+      // 输出计数器
       mapOutputByteCounter = reporter.getCounter(TaskCounter.MAP_OUTPUT_BYTES);
       mapOutputRecordCounter =
         reporter.getCounter(TaskCounter.MAP_OUTPUT_RECORDS);
@@ -1062,10 +1112,11 @@ public class MapTask extends Task {
           .getCounter(TaskCounter.MAP_OUTPUT_MATERIALIZED_BYTES);
 
       // compression
+      // 是否对Map的输出进行压缩决定于变量"mapred.compress.map.output"，默认不压缩。
       if (job.getCompressMapOutput()) {
         Class<? extends CompressionCodec> codecClass =
-          job.getMapOutputCompressorClass(DefaultCodec.class);
-        codec = ReflectionUtils.newInstance(codecClass, job);
+          job.getMapOutputCompressorClass(DefaultCodec.class); // map输出数据压缩组件class
+        codec = ReflectionUtils.newInstance(codecClass, job); // 实例化map输出数据压缩对象
       } else {
         codec = null;
       }
@@ -1075,25 +1126,26 @@ public class MapTask extends Task {
         reporter.getCounter(TaskCounter.COMBINE_INPUT_RECORDS);
       combinerRunner = CombinerRunner.create(job, getTaskID(), 
                                              combineInputCounter,
-                                             reporter, null);
-      if (combinerRunner != null) {
+                                             reporter, null); // 构建CombinerRunner，CombinerRunner是一个抽象类，根据新旧API的不同，有两种实现：OldCombinerRunner、NewCombinerRunner
+      if (combinerRunner != null) { // 如果 combiner不为null，则创建combiner的输出对象combineCollector
         final Counters.Counter combineOutputCounter =
           reporter.getCounter(TaskCounter.COMBINE_OUTPUT_RECORDS);
-        combineCollector= new CombineOutputCollector<K,V>(combineOutputCounter, reporter, job);
+        combineCollector= new CombineOutputCollector<K,V>(combineOutputCounter, reporter, job); // 构造combiner的数据输出器
       } else {
         combineCollector = null;
       }
-      spillInProgress = false;
+      spillInProgress = false; // split运行状态
+      // 最后一次merge时，在有combiner的情况下，超过此阈值才执行combiner
       minSpillsForCombine = job.getInt(JobContext.MAP_COMBINE_MIN_SPILLS, 3);
-      spillThread.setDaemon(true);
-      spillThread.setName("SpillThread");
-      spillLock.lock();
+      spillThread.setDaemon(true); // spill线程设置Daemon线程
+      spillThread.setName("SpillThread"); // spill数据溢写线程名称
+      spillLock.lock(); // 加锁，splitThread只能单独工作
       try {
-        spillThread.start();
-        while (!spillThreadRunning) {
+        spillThread.start(); // 线程启动
+        while (!spillThreadRunning) { // 如果溢写数据的标志位是false表示spillThread目录还不需要工作，先await()等待，等待什么呢？等待环形缓冲区的数据达到溢写伐值了(默认80%)，写数据的线程调用signal()唤醒此线程开始将数据溢写磁盘操作
           spillDone.await();
         }
-      } catch (InterruptedException e) {
+      } catch (InterruptedException e) { // 线程被打断
         throw new IOException("Spill thread failed to initialize", e);
       } finally {
         spillLock.unlock();
@@ -1108,10 +1160,14 @@ public class MapTask extends Task {
      * Serialize the key, value to intermediate storage.
      * When this method returns, kvindex must refer to sufficient unused
      * storage to store one METADATA.
+     * 
+     * 将键、值序列化到中间存储。当此方法返回时，kvindex必须引用足够的未使用存储空间来存储一个元数据。
+     * 
+     * 实际上是我们在map方法代码里写的，Context.write，间接调用的此方法，将数据写到内存缓冲区
      */
     public synchronized void collect(K key, V value, final int partition
                                      ) throws IOException {
-      reporter.progress();
+      reporter.progress(); // 设置进度标志为true
       if (key.getClass() != keyClass) {
         throw new IOException("Type mismatch in key from map: expected "
                               + keyClass.getName() + ", received "
@@ -1122,13 +1178,15 @@ public class MapTask extends Task {
                               + valClass.getName() + ", received "
                               + value.getClass().getName());
       }
+      // partition 当前数据要写入的分区
       if (partition < 0 || partition >= partitions) {
         throw new IOException("Illegal partition for " + key + " (" +
             partition + ")");
       }
       checkSpillException();
-      bufferRemaining -= METASIZE;
-      if (bufferRemaining <= 0) {
+      // 新数据collect时，先将剩余的空间减去元数据的长度，之后进行判断
+      bufferRemaining -= METASIZE; // METASIZE 16
+      if (bufferRemaining <= 0) { // bufferRemaining 是buffer缓冲区的伐值剩余大小，比如buffer缓冲区是100m，伐值是80%，那就是数据写满了80m后(bufferRemaining为0)，触发溢写磁盘的操作
         // start spill if the thread is not running and the soft limit has been
         // reached
         spillLock.lock();
@@ -1189,38 +1247,65 @@ public class MapTask extends Task {
 
       try {
         // serialize key bytes into buffer
-        int keystart = bufindex;
-        keySerializer.serialize(key);
-        if (bufindex < keystart) {
+        int keystart = bufindex; // bufindex 表示buffer缓冲区中下一个可以写入的数据的位置
+        keySerializer.serialize(key); // 写key: 这里就调用了 WritableSerialization.WritableSerializer.serialize(Writable w) -> w.write(dataOut);通过很多层最终通过Buffer的write()方法来向缓冲区写入数据
+        
+        /**
+         * 写入key之后会在collect中判断bufindex < keystart，当bufindex小时，则key被分开存储，执行bb.shiftBufferedKey()
+         * value则直接写入，不用判断是否被分开存储，key不能分开存储是因为要对key进行排序
+         */
+        if (bufindex < keystart) { // bufindex < keystart 表示什么？表示kvbuffer已经写满了，又从kvbuffer的开始位置写数据了
           // wrapped the key; must make contiguous
           bb.shiftBufferedKey();
           keystart = 0;
         }
         // serialize value bytes into buffer
-        final int valstart = bufindex;
-        valSerializer.serialize(value);
+        final int valstart = bufindex; // kvbuffer下一个可以写入数据的位置
+        valSerializer.serialize(value); // 写value: 这里就调用了 WritableSerialization.WritableSerializer.serialize(Writable w) -> w.write(dataOut);通过很多层最终通过Buffer的write()方法来向缓冲区写入数据
         // It's possible for records to have zero length, i.e. the serializer
         // will perform no writes. To ensure that the boundary conditions are
         // checked and that the kvindex invariant is maintained, perform a
         // zero-length write into the buffer. The logic monitoring this could be
         // moved into collect, but this is cleaner and inexpensive. For now, it
-        // is acceptable.
-        bb.write(b0, 0, 0);
+        // is acceptable. 
+        bb.write(b0, 0, 0); // 写完一个key/value对之后，写入 一个 private final byte[] b0 = new byte[0];
 
         // the record must be marked after the preceding write, as the metadata
         // for this record are not yet written
-        int valend = bb.markRecord();
+        int valend = bb.markRecord(); // 每写完一个kev/value对之后，更新bufmark
 
-        mapOutputRecordCounter.increment(1);
+        mapOutputRecordCounter.increment(1); // 输出记录(key/value)数据计数
         mapOutputByteCounter.increment(
-            distanceTo(keystart, valend, bufvoid));
+            distanceTo(keystart, valend, bufvoid)); // 输出数据字节大小计数
+        /**
+         *	 int distanceTo(final int i, final int j, final int mod) {
+		 *     return i <= j
+		 *       ? j - i
+		 *       : mod - i + j;
+		 *   }
+		 *   
+		 *   keystart: i 	表示此次写数据的开始位置(bufindex)
+		 *   valend: j		表示此次写数据的结束位置(bufmark)
+		 *   bufvoid: mod	表示kvbuffer的结束位置(bufvoid)
+		 *   解释一下：
+		 *   	keystart <= valend 是正常的情况，那此次写的key/value长度就是 valend - keystart
+		 *   	如果 keystart 比 valend 大，表示已经写到了结尾，又从头开始写数据了
+		 *   		那长度就是  bufvoid(kvbuffer结果位置) - keystart(bufindex) + valend(bufmark)
+		 *   		意思是，如果数据已经写满了kvbuffer，就得再从头开始写，那这个key/value的数量是结尾的一块 + 开头的一块，那计算长度就是， bufvoid(kvbuffer结果位置) - keystart(bufindex): 表示结尾的一块，再  + valend(bufmark)，加上开头的一块
+         */
 
         // write accounting info
-        kvmeta.put(kvindex + PARTITION, partition);
-        kvmeta.put(kvindex + KEYSTART, keystart);
-        kvmeta.put(kvindex + VALSTART, valstart);
-        kvmeta.put(kvindex + VALLEN, distanceTo(valstart, valend));
+        kvmeta.put(kvindex + PARTITION, partition); // 记录本次写入key/value，partition分区号
+        kvmeta.put(kvindex + KEYSTART, keystart); // 记录本次写入key/value，key的起始位置
+        kvmeta.put(kvindex + VALSTART, valstart); // 记录本次写入key/value，value的起始位置
+        kvmeta.put(kvindex + VALLEN, distanceTo(valstart, valend)); // 记录本次写入value的长度
+        
         // advance kvindex
+        /**
+         * 重新计算kvindex，推进
+         * 
+         * kvmeta.capacity(): 是kvmeta IntBuffer的总大小，初始化的时候是用kvbuffer的大小，但kvbuffer是字节数组，而IntBuffer是Int数组，一个int占4个字节，所以IntBuffer的长度是kvbuffer长度的1/4
+         */
         kvindex = (kvindex - NMETA + kvmeta.capacity()) % kvmeta.capacity();
       } catch (MapBufferTooSmallException e) {
         LOG.info("Record too large for in-memory buffer: " + e.getMessage());
@@ -1239,11 +1324,16 @@ public class MapTask extends Task {
      * indices are aligned with the buffer, so metadata never spans the ends of
      * the circular buffer.
      */
+    /**
+     * 设置kvbuffer和kvmeta的分界线
+     */
     private void setEquator(int pos) {
       equator = pos;
       // set index prior to first entry, aligned at meta boundary
-      final int aligned = pos - (pos % METASIZE);
+      // 第一个 entry的末尾位置，即元数据和kv数据的分界线   单位是byte
+      final int aligned = pos - (pos % METASIZE); // 0 - (0 % 16)
       // Cast one of the operands to long to avoid integer overflow
+      // 元数据中存放数据的起始位置(在Intbuffer中的起始位置) 26214396 	IntBuffer: java.nio.ByteBufferAsIntBufferL[pos=0 lim=26214400 cap=26214400]
       kvindex = (int)
         (((long)aligned - METASIZE + kvbuffer.length) % kvbuffer.length) / 4;
       LOG.info("(EQUATOR) " + pos + " kvi " + kvindex +
@@ -1254,6 +1344,8 @@ public class MapTask extends Task {
      * The spill is complete, so set the buffer and meta indices to be equal to
      * the new equator to free space for continuing collection. Note that when
      * kvindex == kvend == kvstart, the buffer is empty.
+     * 
+     * 溢出完成了，因此将缓冲区和元索引设置为等于新赤道，以便释放空间以继续收集。注意，当kvindex == kvend == kvstart时，缓冲区是空的。
      */
     private void resetSpill() {
       final int e = equator;
@@ -1279,6 +1371,8 @@ public class MapTask extends Task {
     /**
      * Compute the distance between two indices in the circular buffer given the
      * max distance.
+     * 
+     * 给定最大距离，计算循环缓冲区中两个索引之间的距离
      */
     int distanceTo(final int i, final int j, final int mod) {
       return i <= j
@@ -1332,6 +1426,10 @@ public class MapTask extends Task {
 
     /**
      * Inner class managing the spill of serialized records to disk.
+     * 
+     * 管理序列化记录到磁盘的溢出的内部类。
+     * 
+     * BlockingBuffer是MapOutputBuffer的一个内部类，继承于java.io.DataOutputStream，keySerializer和valSerializer使用BlockingBuffer的意义在于将序列化后的Key或Value送入BlockingBuffer
      */
     protected class BlockingBuffer extends DataOutputStream {
 
@@ -1342,6 +1440,9 @@ public class MapTask extends Task {
       /**
        * Mark end of record. Note that this is required if the buffer is to
        * cut the spill in the proper place.
+       */
+      /**
+       * 每写完一个kev/value对之后，记录bufmark就是bufindex
        */
       public int markRecord() {
         bufmark = bufindex;
@@ -1360,32 +1461,82 @@ public class MapTask extends Task {
        * likely result in data loss or corruption.
        * @see #markRecord()
        */
+      /**
+       * 如果key被截断存储，将调用这个方法，将截断的key的数据移动一下，形成一个整体的key，因为key是要排序所以最好不好被截断
+       * 
+       * kvbuffer: [.................keyvaluekeyvalue|ke|]
+       *                                             |  |  
+       *                                       bufmark  bufvoid
+       *                                       
+       *                                       由此可以看出，最后一个key因为空间不够了，所以只能截断存储，前面一部分key(ke)存在kvbuffer的末尾，后面一部分的key(y)存在kvbuffer的起始位置
+       *                                       这个方法要做的是，将kvbuffer末尾的一部分key挪动到kvbuffer头部如下：
+       *                                        kvbuffer: [key.................keyvaluekeyvalue|]
+       *                                                                                       ｜
+       *                                                                                       bufmark
+       *                                                                                       bufvoid
+       *                                       如上所述：被截断的key(ke)(y)被完整的补齐了，(y)及后面的数据向后移动了(bufvoid - bufmark)个单位，(ke)被移动到了开始位置
+       *                                       最终bufvoid = bufmark，表示只要读数据到bufvoid就可以了
+       */
       protected void shiftBufferedKey() throws IOException {
         // spillLock unnecessary; both kvend and kvindex are current
-        int headbytelen = bufvoid - bufmark; // 尾部长度
-        bufvoid = bufmark; // 重置bufvoid
-        final int kvbidx = 4 * kvindex;
-        final int kvbend = 4 * kvend;
-        final int avail = // 从头部到mata数据的空间
+        int headbytelen = bufvoid - bufmark; // 被截断的数据存储在kvbuffer末尾的长度；如上所示，bufvoid表示kvbuffer的末尾，bufmark表示最后(上一次)写入的key/value的位置+1，所以被截断的数据存储在kvbuffer末尾的长度就是这么算的
+        bufvoid = bufmark; // 重置bufvoid用于对脏数据隔断，在spill时，就读到bufvoid；因为末尾这些数据要被复制到kvbuffer的头部存储，所以这些bufvoid末尾的数据没意义了
+        final int kvbidx = 4 * kvindex; // 拿到kvindex在kvbuffer的位置(int占4个字节所以*4)
+        final int kvbend = 4 * kvend; // 拿到kvend在kvbuffer的位置(int占4个字节所以*4)
+        final int avail = // meta的实际存储位置，为什么取min小的？因为meta在bufindex中是倒着(逆时针存储)
           Math.min(distanceTo(0, kvbidx), distanceTo(0, kvbend));
-        if (bufindex + headbytelen < avail) { // 头部开始的剩余空间足够放下整个key
-          System.arraycopy(kvbuffer, 0, kvbuffer, headbytelen, bufindex); // 原来在头部的那部分key拷贝到从headbytelen开始的位置
-          System.arraycopy(kvbuffer, bufvoid, kvbuffer, 0, headbytelen); // 原来在尾部的那部分key拷贝到从0开始的位置
-          bufindex += headbytelen; // 更新变量
-          bufferRemaining -= kvbuffer.length - bufvoid; // 更新变量
-        } else { // 头部的剩余空间不足
-          byte[] keytmp = new byte[bufindex];
-          System.arraycopy(kvbuffer, 0, keytmp, 0, bufindex); // 暂存头部那部分key
-          bufindex = 0;
+        /**
+         * avail是计算meta数据的最大存储位置
+         * 
+         * 可能会不解，是要移动kvbuffer中的key为什么要涉及到meta存储大小？
+         * 因为在环形缓冲区中，以equator为分界线，向右是存储key/value，向左是存储meta
+         * 
+         * 那么为什么要计算kvindex、kvend在kvbuffer中的位置？
+         * 因为要判断key/value顺时针写数据与meta逆时针写数据是不是重叠了，表示kvbuffer环形缓冲区是不是写满了
+         * avail取Math.min(*, *)是因为meta是逆时针写数据数值越小，就表示meta写的越大
+         * 
+         * 那么这里判断bufindex + headbytelen，表示从kvbuffer可以写数据的位置(bufindex)再增加headbytelen个位置(在kvbuffer末尾，被截断的key前半段)
+         * 如果小于avail，就表示如果将:kvbuffer末尾被截断的key前半段增加拷贝过来，是可以被kvbuffer所容纳的，表示kvbuffer有足够的空间放下kvbuffer末尾被截断的key前半段增
+         * 	如下：
+         * 		[              kvbuffer                 ]
+         * 		 -------------|                 |-------- 
+         * 				  avail                 bufindex
+         * 
+         * 		 // 表示 bufindex + headbytelen < avail，空间充足
+         *       -------------|   |-------------|--------
+         *                avail   headbytelen + bufindex 
+         *                
+         *       // 表示 bufindex + headbytelen > avail，空间不足
+         *       -------------|
+         *       		  avail
+         *                  |-------------|--------
+         *                  headbytelen + bufindex
+         *
+         */
+        if (bufindex + headbytelen < avail) { // kvbuffer的剩余空间，足够放下kvbuffer末尾被截断的key的前半段
+          System.arraycopy(kvbuffer, 0, kvbuffer, headbytelen, bufindex); // 先将kvbuffer数据向后移动headbytelen个字节单位，因为要从kvbuffer尾部拷贝过headbytelen长度的数据到头部
+          System.arraycopy(kvbuffer, bufvoid, kvbuffer, 0, headbytelen); // 将kvbuffer尾部那部分不完整的数据拷贝到头部来；因为bufvoid已经被更新成了bufmark，bufmark表示新写入key的起点位置，拷贝headbytelen个长度到头部0位置
+          bufindex += headbytelen; // 更bufindex因为刚刚加了headbytelen长度数据到kvbuffer头部
+          bufferRemaining -= kvbuffer.length - bufvoid; // 更新：减少kvbuffer使用的空间，为0时触发spill
+        } else { // kvbuffer的剩余空间，不能够放下kvbuffer末尾被截断的key的前半段
+          byte[] keytmp = new byte[bufindex]; // 创建一个bufindex长度的数据，因为从0到bufindex是key被截断的后半断
+          System.arraycopy(kvbuffer, 0, keytmp, 0, bufindex); // 暂存被截断的key后半断
+          bufindex = 0; // 将bufindex归位
           /**
            *  调用Buffer类的write方法，会处理空间不够的情况
            */
-          out.write(kvbuffer, bufmark, headbytelen); // 先从0开始拷贝尾部的key
-          out.write(keytmp); // 接上暂存的头部那部分key
+          out.write(kvbuffer, bufmark, headbytelen); // 先将被截断的key的前半断写入kvbuffer(即kvbuffer尾部的那断key)
+          out.write(keytmp); // 再将被截断key的后半断写入kvbuffer
         }
       }
     }
 
+    /**
+     * 在此处，BlockingBuffer内部又引入一个类：Buffer，也是MapOutputBuffer的一个内部类，继承于java.io.OutputStream。为什么要引入两个类呢？
+     * BlockingBuffer和Buffer有什么区别？初步来看，Buffer是一个基本的缓冲区，提供了write方法，BlockingBuffer提供了markRecord、shiftBufferedKey方法，处理Buffer的边界等一些特殊情况，
+     * 是Buffer的进一步封装，可以理解为是增强了Buffer的功能。Buffer实际上最终也封装了一个字节缓冲区，即后面我们要分析的非常关键的byte[] kvbuffer，基本上，Map之后的结果暂时都会存入kvbuffer这个缓存区，等到要慢的时候再刷写到磁盘，
+     * Buffer这个类的作用就是对kvbuffer进行封装
+     */
     public class Buffer extends OutputStream {
       private final byte[] scratch = new byte[1];
 
@@ -1403,13 +1554,18 @@ public class MapTask extends Task {
        * @throws MapBufferTooSmallException if record is too large to
        *    deserialize into the collection buffer.
        */
+      /**
+       * byte b[]: 数据的字节数组
+       * int off: 本次要写入的数据字节数组开始从off位置向kvbuffer中拷贝数据
+       * int len: 本次要写入的数据字节数组还剩余多少长度的数据没有拷贝到kvbuffer
+       */
       @Override
       public void write(byte b[], int off, int len)
           throws IOException {
         // must always verify the invariant that at least METASIZE bytes are
         // available beyond kvindex, even when len == 0
-        bufferRemaining -= len;
-        if (bufferRemaining <= 0) {
+        bufferRemaining -= len; // 减去数据占用大小
+        if (bufferRemaining <= 0) { // bufferRemaining 是buffer缓冲区的伐值剩余大小，比如buffer缓冲区是100m，伐值是80%，那就是数据写满了80m后(bufferRemaining为0)，触发溢写磁盘的操作
           // writing these bytes could exhaust available buffer space or fill
           // the buffer to soft limit. check if spill or blocking are necessary
           boolean blockwrite = false;
@@ -1490,15 +1646,33 @@ public class MapTask extends Task {
           }
         }
         // here, we know that we have sufficient space to write
-        if (bufindex + len > bufvoid) { // bufindex是起点，bufindex+len是终点，如果终点超过buffer的长度（bufvoid)
-          final int gaplen = bufvoid - bufindex; // 多余的部分
-          System.arraycopy(b, off, kvbuffer, bufindex, gaplen); // 将多余部分移到buffer开始的部分
-          len -= gaplen; // 减去剩余的长度
-          off += gaplen; // 加上使用的长度
-          bufindex = 0; // bufindex设置成开始位置
+        
+        /**
+         * System.arraycopy就是将要写入的b（序列化后的数据）写入到kvbuffer中。关于kvbuffer，我们后面会详细分析，这里需要知道的是序列化后的结果会调用该方法进一步写入到kvbuffer也就是Map后结果的缓存中，
+         * 后面可以看见，kvbuffer写到一定程度的时候（80%），需要将已经写了的结果刷写到磁盘，这个工作是由Buffer的write判断的。在kvbuffer这样的字节数组中，会被封装为一个环形缓冲区，
+         * 这样，一个Key可能会切分为两部分，一部分在尾部，一部分在字节数组的开始位置，虽然这样读写没问题，但在对KeyValue进行排序时，需要对Key进行比较，这时候需要Key保持字节连续，
+         * 因此，当出现这种情况下，需要对Buffer进行重启（reset）操作，这个功能是在BlockingBuffer中完成的，因此，Buffer相当于封装了kvbuffer，实现环形缓冲区等功能，
+         * BlockingBuffer则继续对此进行封装，使其支持内部Key的比较功能。本质上，这个缓冲区需要是一个Key-Value记录的缓冲区，而byte[] kvbuffer只是一个字节缓冲区，因此需要进行更高层次的封装。
+         * 比如：1，到达一定程度需要刷写磁盘；2，Key需要保持字节连续等等
+         */
+        
+        /**
+         * bufindex是下一个数据可以写入的位置，加上本次写入数据的长度，就表示将本条数据写入缓冲区后所有数据实际在内存中占的位置
+         * 
+         * bufvoid表示缓冲区buffer的长度，比如100m，就只能在内存中写入100m的数据，如果超出这个长度，就得得位，从0开始写(环形缓冲区)
+         */
+        /**
+         * write方法将key/value写入kvbuffer中，如果bufindex+len超过了bufvoid，则将写入的内容分开存储，将一部分写入bufindex和bufvoid之间，然后重置bufindex，将剩余的部分写入，这里不区分key和value
+         */
+        if (bufindex + len > bufvoid) { // 如果数据长度超过buffer的长度（bufvoid)
+          final int gaplen = bufvoid - bufindex; // buffer剩余的空间
+          System.arraycopy(b, off, kvbuffer, bufindex, gaplen); // 只拷贝b[](此次要写入数据的字节数组)gaplen长度的数据到kvbuffer中，因为kvbuffer只剩下gaplen空间了，得将指针复位到kvbuffer的起始位置，再写入剩余的数据
+          len -= gaplen; // len: 减去已经拷贝到kvbuffer中的数据长度，还剩余多少长度的数据没有拷贝到kvbuffer中
+          off += gaplen; // off: 加上已经写入到kvbuffer中的字节数组长度，表示下次从这个地方开始写入数据
+          bufindex = 0; // 这个地方很关键，将kvbuffer的bufindex(可以写入数据的下一个位置)负0，开示从缓冲区的头起始位置开始写入数据；这里思考一个问题，如果spillThread线程还没有将数据全部刷到磁盘，此时kvbuffer 0 ~ (bufend-1)的空间还没释放怎么办
         }
-        System.arraycopy(b, off, kvbuffer, bufindex, len); // 位置输出
-        bufindex += len; // 加上使用的长度
+        System.arraycopy(b, off, kvbuffer, bufindex, len); // 将数据拷贝到kvbuffer(这里可以放心大胆的拷贝数据，因为数据超出长度的情况上面已经判断过了)
+        bufindex += len; // 更新bufindex，表示下一个可以写入数据的位置
       }
     }
 
@@ -1606,11 +1780,15 @@ public class MapTask extends Task {
       }
     }
 
+    /**
+     * kvbuffer达到80%的时候，触发溢写操作，将数据分区、排序、刷入磁盘
+     */
     private void startSpill() {
-      assert !spillInProgress;
+      assert !spillInProgress; // 调试用的不用理会
+      // 元数据的边界；为什么是(kvindex + NMETA)？因为meta是环形缓冲区逆时针写的，kvindex表示下一个可以写的位置，要定位到meta数据结束的位置就得减去一个单位，逆时针的，就得 + NMETA；取%是因为环形结构
       kvend = (kvindex + NMETA) % kvmeta.capacity();
-      bufend = bufmark;
-      spillInProgress = true;
+      bufend = bufmark; // 调整bufend位置，溢写数据时，对bufstart~bufend区间的数据进行溢写
+      spillInProgress = true; // 溢写数据标记为true
       LOG.info("Spilling map output");
       LOG.info("bufstart = " + bufstart + "; bufend = " + bufmark +
                "; bufvoid = " + bufvoid);
@@ -1618,7 +1796,7 @@ public class MapTask extends Task {
                "); kvend = " + kvend + "(" + (kvend * 4) +
                "); length = " + (distanceTo(kvend, kvstart,
                      kvmeta.capacity()) + 1) + "/" + maxRec);
-      spillReady.signal();
+      spillReady.signal(); // 通知 spillReady.await();
     }
 
     private void sortAndSpill() throws IOException, ClassNotFoundException,

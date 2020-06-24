@@ -221,14 +221,14 @@ public class YarnClientImpl extends YarnClient {
   public ApplicationId
       submitApplication(ApplicationSubmissionContext appContext)
           throws YarnException, IOException {
-    ApplicationId applicationId = appContext.getApplicationId();
+    ApplicationId applicationId = appContext.getApplicationId(); // 获取ApplicationId
     if (applicationId == null) {
       throw new ApplicationIdNotProvidedException(
           "ApplicationId is not provided in ApplicationSubmissionContext");
     }
     SubmitApplicationRequest request =
         Records.newRecord(SubmitApplicationRequest.class);
-    request.setApplicationSubmissionContext(appContext);
+    request.setApplicationSubmissionContext(appContext); // 生成提交Application的请求对象Request
 
     // Automatically add the timeline DT into the CLC
     // Only when the security and the timeline service are both enabled
@@ -237,7 +237,7 @@ public class YarnClientImpl extends YarnClient {
     }
 
     //TODO: YARN-1763:Handle RM failovers during the submitApplication call.
-    rmClient.submitApplication(request);
+    rmClient.submitApplication(request); // org.apache.hadoop.yarn.api.ApplicationClientProtocol 代理对象提交Application
 
     int pollCount = 0;
     long startTime = System.currentTimeMillis();
