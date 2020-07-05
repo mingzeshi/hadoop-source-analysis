@@ -976,20 +976,23 @@ public class MapTask extends Task {
     private static final int METASIZE = NMETA * 4; // size in bytes
 
     // spill accounting
-    private int maxRec;
-    private int softLimit;
-    boolean spillInProgress;;
-    int bufferRemaining;
+    private int maxRec; // kvmeta可以存放元数据的组数(一组4个int，如上↑)
+    private int softLimit; // 数据可以写入的空间大小
+    boolean spillInProgress; // 数据溢写是否在处理中
+    int bufferRemaining; // buffer触发溢写磁盘的剩余空间
+    // 数据溢写线程异常，这个是在init()方法中使用的；在初始化init()方法的时候，如果SpillThread在启动的时候出现了异常，会负值于这个变量；如果sortSpillException不为null，init()方法会抛出异常，mr任务运行结束
     volatile Throwable sortSpillException = null;
 
     int numSpills = 0;
     private int minSpillsForCombine;
     private IndexedSorter sorter;
-    final ReentrantLock spillLock = new ReentrantLock();
+    final ReentrantLock spillLock = new ReentrantLock(); // 数据溢写时的锁
+    // 线程通信器，在写数据的线程运行中，如果kvbuffer写满了，则调用spillDone.await()来等待，直到数据溢到磁盘后，kvbuffer有了空间，再调用spillDone.signal()来唤醒，继续写数据
     final Condition spillDone = spillLock.newCondition();
+    // 线程通信器，spillThread在运行过程中，如果kvbuffer中的数据没有达到溢写的阈值(80%)，则spillReady.await()来阻塞，直到kvbuffer中的数据达到溢写的阈值(80%)后，才调用spillReady.signal()来唤醒，开始溢写数据
     final Condition spillReady = spillLock.newCondition();
-    final BlockingBuffer bb = new BlockingBuffer();
-    volatile boolean spillThreadRunning = false;
+    final BlockingBuffer bb = new BlockingBuffer(); // 写入数据的buffer组件，封装了org.apache.hadoop.mapred.MapTask.MapOutputBuffer.Buffer，实际是Buffer负责写数据的
+    volatile boolean spillThreadRunning = false; // 数据溢写磁盘线程是否在运行
     final SpillThread spillThread = new SpillThread(); // 数据溢写线程
 
     private FileSystem rfs;
@@ -1142,7 +1145,7 @@ public class MapTask extends Task {
       spillLock.lock(); // 加锁，splitThread只能单独工作
       try {
         spillThread.start(); // 线程启动
-        while (!spillThreadRunning) { // 如果溢写数据的标志位是false表示spillThread目录还不需要工作，先await()等待，等待什么呢？等待环形缓冲区的数据达到溢写伐值了(默认80%)，写数据的线程调用signal()唤醒此线程开始将数据溢写磁盘操作
+        while (!spillThreadRunning) { // 如果溢写数据的线程还没有运行，就await等待，并释放锁；在这里释放了锁，spillThread线程就会获取到锁
           spillDone.await();
         }
       } catch (InterruptedException e) { // 线程被打断
@@ -1189,59 +1192,105 @@ public class MapTask extends Task {
       if (bufferRemaining <= 0) { // bufferRemaining 是buffer缓冲区的伐值剩余大小，比如buffer缓冲区是100m，伐值是80%，那就是数据写满了80m后(bufferRemaining为0)，触发溢写磁盘的操作
         // start spill if the thread is not running and the soft limit has been
         // reached
-        spillLock.lock();
+        spillLock.lock(); // 加溢写数据锁
         try {
           do {
-            if (!spillInProgress) {
-              final int kvbidx = 4 * kvindex;
-              final int kvbend = 4 * kvend;
+            if (!spillInProgress) { // 首次spillInProgress标志位是false
+              final int kvbidx = 4 * kvindex; // 拿到kvindex在kvbuffer中的位置
+              final int kvbend = 4 * kvend; // 拿到kvend在kvbuffer中的位置
               // serialized, unspilled bytes always lie between kvindex and
               // bufindex, crossing the equator. Note that any void space
               // created by a reset must be included in "used" bytes
-              final int bUsed = distanceTo(kvbidx, bufindex);
-              final boolean bufsoftlimit = bUsed >= softLimit;
-              if ((kvbend + METASIZE) % kvbuffer.length !=
-                  equator - (equator % METASIZE)) {
+              final int bUsed = distanceTo(kvbidx, bufindex); // 拿到已经使用的内存空间大小
+              final boolean bufsoftlimit = bUsed >= softLimit; // 已写入数据的空间，是否大于总共可以写入数据的空间；就是约定可以写入kvbuffer80m，判断实际写入的数据是否大于等于80m
+              /**
+               * 如果相等，表示还没有触发spill溢写，否则是已经触发了溢写操作
+               * 
+               * 如果没有触发溢写操作，(kvbend + METASIZE)与equator应该是相等的
+               * 
+               * 其实equator - (equator % METASIZE)，就是aligned，如果aligned等于kvend(kvbend)，表示没有触发过溢写，否则表示已经触发过溢写了
+               * 触发溢写时，spillInProgress为true，如果进入到这里，spillInProgress为false，是在spillThread溢写完成结束之后将spillInProgress修改为false的
+               * 也就是说如果触发过溢写操作，并且spillInProgress为false，那可以得出本次spill已经完成了
+               * 既然本次spill已经完成了，那就可以重置一些值，比如： bufstart、bufend、kvstart、kvend、aligned，在resetSpill()方法中
+               * 否则触发溢写startSpill()
+               */
+              if ((kvbend + METASIZE) % kvbuffer.length != // kvbend表示最后一组meta的起始位置，kvbend + METASIZE表示是溢写数据的结束边界，取余kvbuffer.length是因为kvbuffer是环形数据结构，在边界时得以循环； 例如：kvbuffer.length长度是100，kvbend是98，METASIZE是4，(98 + 4) % 100，最终等于2，才得以循环
+                  equator - (equator % METASIZE)) { // (equator % METASIZE)是计算equator的位置到原点能装下多少个META(METASIZE)，最终得到equator到原点装不下一个meta的大小
                 // spill finished, reclaim space
-                resetSpill();
-                bufferRemaining = Math.min(
-                    distanceTo(bufindex, kvbidx) - 2 * METASIZE,
-                    softLimit - bUsed) - METASIZE;
+                resetSpill(); // 重新设置 bufstart、bufend、kvstart、kvend、aligned
+                bufferRemaining = Math.min( // 重置bufferRemaining
+            		/**
+              	   	 * 减去  2 * METASIZE：
+              	     * 此时，已有一个record要写入buffer，需要从bufferRemaining中减去当前record的元数据占用的空间，即减去METASIZE
+              	     * 另一个METASIZE是在计算equator时，没有包括kvindex到kvend(spill之前)的这段METASIZE，所以要减去这个METASIZE
+              	     */
+                    distanceTo(bufindex, kvbidx) - 2 * METASIZE, // 得到kvbuffer的剩余空间，减去 2 * METASIZE
+                    /**
+                     * softLimit  可以写入kvbuffer的内存大小
+                     * bUsed  已经写入的内存大小
+                     * softLimit - bUsed  表示剩余可以使用、写入数据的内存大小
+                     */
+                    softLimit - bUsed) - METASIZE; // 计算出可以写入kvbuffer的最小空间大小，并减去一个METASIZE(即将要写入的meta大小)，即为最终的bufferRemaining
                 continue;
-              } else if (bufsoftlimit && kvindex != kvend) {
+              } else if (bufsoftlimit && kvindex != kvend) { // 如果写入的数据已经超过了限制大小，并且kvindex != kvend(严谨判断)只有在开始的时候它们会被负于相等的值
                 // spill records, if any collected; check latter, as it may
                 // be possible for metadata alignment to hit spill pcnt
-                startSpill();
-                final int avgRec = (int)
-                  (mapOutputByteCounter.getCounter() /
-                  mapOutputRecordCounter.getCounter());
+                startSpill(); // 启动数据溢写操作，
+                final int avgRec = (int) // 计算出平均每条写入记录的大小
+                  (mapOutputByteCounter.getCounter() / // 总共写入数据的大小
+                  mapOutputRecordCounter.getCounter()); // 总共写入数据的记录数
                 // leave at least half the split buffer for serialization data
                 // ensure that kvindex >= bufindex
-                final int distkvi = distanceTo(bufindex, kvbidx);
+                final int distkvi = distanceTo(bufindex, kvbidx); // 计算出kvbuffer的剩余空间
+                /**
+                 * 计算出新的equator位置
+                 * 
+                 * Math.max(2 * METASIZE - 1, : 因为distkvi中最少得存放一个meta，所占空间为METASIZE，在选取kvindex时需要求aligned，aligned最多为METASIZE-1
+                 * 
+	             *     Math.min(distkvi / 2,
+	             *                     distkvi / (METASIZE + avgRec) * METASIZE))) : 这一步是要计算得出kvbuffer剩余可用的空间可以存放元数据的大小，最大给 1/2，与计算得出的meta可存放空间相比，取最小值；如下计算过程：
+	             *                      
+	             *     		distkvi / 2 :	剩余空间 / 2表示得到kvbuffer剩余的空间大小的1/2
+	             *     
+	             *     		distkvi / (METASIZE + avgRec) * METASIZE：
+	             *     				(METASIZE + avgRec) 							表示一条数据的大小(metasizt + 平均数据的大小)
+	             *     				distkvi / (METASIZE + avgRec)					表示剩余空间  / 每条数据的大小，得出预计可以写入多少条数据
+	             *     				distkvi / (METASIZE + avgRec) * METASIZE		表示可以写入的数据条数 * METASIZE，最终得出预计可以写入的元数据条数所占的空间大小
+                 * 
+                 * 因为equator是kvbuffer和kvmeta的分界线，为了更多的空间存储kv，则最多拿出distkvi的一半来存储meta，并且利用avgRec估算distkvi能存放多少个record和meta对，
+                 * 根据record和meta对的个数估算meta所占空间的大小，从distkvi/2和meta所占空间的大小中取最小值，
+                 * 又因为distkvi中最少得存放一个meta，所占空间为METASIZE，在选取kvindex时需要求aligned，aligned最多为METASIZE-1，总和上述因素，最终选取equator为
+                 */
                 final int newPos = (bufindex +
                   Math.max(2 * METASIZE - 1,
                           Math.min(distkvi / 2,
                                    distkvi / (METASIZE + avgRec) * METASIZE)))
-                  % kvbuffer.length;
-                setEquator(newPos);
-                bufmark = bufindex = newPos;
-                final int serBound = 4 * kvend;
+                  % kvbuffer.length; // 取余kvbuffer.length是因为kvbuffer是环形数据结构，在边界时得以循环； 例如：kvbuffer.length长度是100，kvbend是98，METASIZE是4，(98 + 4) % 100，最终等于2，才得以循环
+                setEquator(newPos); // 设置新的 equator，其中重新设置了kvindex
+                bufmark = bufindex = newPos; // 将bufmark、bufindex重置成equator，表示在kvbuffer中从equator开始写record数据
+                final int serBound = 4 * kvend; // 拿到kvend在kvbuffer中的位置；kvend它就是meta元数据的溢写边界，在上面的startSpill()已经被重置
                 // bytes remaining before the lock must be held and limits
                 // checked is the minimum of three arcs: the metadata space, the
                 // serialization space, and the soft limit
-                bufferRemaining = Math.min(
+                // 重新设置bufferRemaining
+                bufferRemaining = Math.min( // 求在spill发生的时候，在剩余可写入数据空间的大小中，计算新equator到meta元数据溢写边界的距离，与新equator到数据溢边界的距离，二者取最小
                     // metadata max
-                    distanceTo(bufend, newPos),
+                    distanceTo(bufend, newPos), // 拿到数据溢写边界到equator的距离；bufend是数据发生溢写时，需要溢写的数据在kvbuffer中的边界，在上面的startSpill()已经被重置；
                     Math.min(
                       // serialization max
-                      distanceTo(newPos, serBound),
-                      // soft limit
-                      softLimit)) - 2 * METASIZE;
+                      distanceTo(newPos, serBound), // 拿到equator到meta元数据的溢写边界的距离
+                      // soft limit 可以写入kvbuffer数据的阈值，就是说，最大可以写入kvbuffer的数据大小不能超过softLimit(这个值是初始化时负值的总大小的80%，在此做Math.min是为了严谨性)
+                      softLimit)) - 2 * METASIZE; // 拿在spill发生时，剩余可写入数据的空间以equator分界线一分为二，二块空间的最小值，并减去2个METASIZE长度，就是新的bufferRemaining
+                	  /**
+                	   * 减去  2 * METASIZE：
+                	   * 此时，已有一个record要写入buffer，需要从bufferRemaining中减去当前record的元数据占用的空间，即减去METASIZE
+                	   * 另一个METASIZE是在计算equator时，没有包括kvindex到kvend(spill之前)的这段METASIZE，所以要减去这个METASIZE
+                	   */
               }
             }
           } while (false);
         } finally {
-          spillLock.unlock();
+          spillLock.unlock(); // 释放溢写数据锁
         }
       }
 
@@ -1330,7 +1379,15 @@ public class MapTask extends Task {
     private void setEquator(int pos) {
       equator = pos;
       // set index prior to first entry, aligned at meta boundary
-      // 第一个 entry的末尾位置，即元数据和kv数据的分界线   单位是byte
+      /**
+       * 第一个 entry之前设置索引，即元数据和kv数据的分界线   单位是byte
+       * 
+       * aligned 表示写元数据的起始位置
+       * 	(pos % METASIZE) 		是表示从equator到kvbuffer的起点(逆时针写)可以写入整对的meta
+       * 	pos - (pos % METASIZE) 	是表示减去，可以写入整对meta后的剩余空间，
+       * 
+       * 最终从aligned位置开始逆时针的写入meta元数据，它不一定与equator一样，但最多相差  METASIZE - 1
+       */
       final int aligned = pos - (pos % METASIZE); // 0 - (0 % 16)
       // Cast one of the operands to long to avoid integer overflow
       // 元数据中存放数据的起始位置(在Intbuffer中的起始位置) 26214396 	IntBuffer: java.nio.ByteBufferAsIntBufferL[pos=0 lim=26214400 cap=26214400]
@@ -1345,14 +1402,15 @@ public class MapTask extends Task {
      * the new equator to free space for continuing collection. Note that when
      * kvindex == kvend == kvstart, the buffer is empty.
      * 
-     * 溢出完成了，因此将缓冲区和元索引设置为等于新赤道，以便释放空间以继续收集。注意，当kvindex == kvend == kvstart时，缓冲区是空的。
+     * 溢写完成了，因此将缓冲区和元索引设置为等于新赤道，以便释放空间以继续收集。注意，当kvindex == kvend == kvstart时，缓冲区是空的。
      */
     private void resetSpill() {
-      final int e = equator;
-      bufstart = bufend = e;
-      final int aligned = e - (e % METASIZE);
+      final int e = equator; // equator，meta与数据分界线
+      bufstart = bufend = e; // 从meta与数据的分界线开始写数据
+      final int aligned = e - (e % METASIZE); // 重新计算aligned，从aligned开始写入meta数据
       // set start/end to point to first meta record
       // Cast one of the operands to long to avoid integer overflow
+      // 元数据中存放数据的起始位置(在Intbuffer中的起始位置)
       kvstart = kvend = (int)
         (((long)aligned - METASIZE + kvbuffer.length) % kvbuffer.length) / 4;
       LOG.info("(RESET) equator " + e + " kv " + kvstart + "(" +
@@ -1568,18 +1626,18 @@ public class MapTask extends Task {
         if (bufferRemaining <= 0) { // bufferRemaining 是buffer缓冲区的伐值剩余大小，比如buffer缓冲区是100m，伐值是80%，那就是数据写满了80m后(bufferRemaining为0)，触发溢写磁盘的操作
           // writing these bytes could exhaust available buffer space or fill
           // the buffer to soft limit. check if spill or blocking are necessary
-          boolean blockwrite = false;
-          spillLock.lock();
+          boolean blockwrite = false; // 是否阻塞写数据
+          spillLock.lock(); // 加溢写数据锁
           try {
             do {
               checkSpillException();
 
-              final int kvbidx = 4 * kvindex;
-              final int kvbend = 4 * kvend;
+              final int kvbidx = 4 * kvindex; // 拿到kvindex在kvbuffer中的位置
+              final int kvbend = 4 * kvend; // 拿到kvend在kvbuffer中的位置
               // ser distance to key index
-              final int distkvi = distanceTo(bufindex, kvbidx);
+              final int distkvi = distanceTo(bufindex, kvbidx); // 在kvbuffer中，bufindex距离kvindex的距离
               // ser distance to spill end index
-              final int distkve = distanceTo(bufindex, kvbend);
+              final int distkve = distanceTo(bufindex, kvbend); // 在kvbuffer中，bufindex距离kvend的距离
 
               // if kvindex is closer than kvend, then a spill is neither in
               // progress nor complete and reset since the lock was held. The
@@ -1589,6 +1647,11 @@ public class MapTask extends Task {
               // then the write should block if there is too little space for
               // either the metadata or the current write. Note that collect
               // ensures its metadata requirement with a zero-length write
+              /**
+               * 如果kvindex比kvend更近，那么溢出既没有进行，也没有完成，并且由于锁被持有而被重置。
+               * 只有在没有足够的空间来完成当前的写操作时，才应该阻塞写操作，为这个记录写入元数据，然后为下一个记录写入元数据。
+               * 如果kvend更近，那么如果元数据或当前写操作的空间太小，那么写操作应该阻塞。注意，collect使用零长度的写确保其元数据需求
+               */
               blockwrite = distkvi <= distkve
                 ? distkvi <= len + 2 * METASIZE
                 : distkve <= len || distanceTo(bufend, kvbidx) < 2 * METASIZE;
@@ -1600,7 +1663,7 @@ public class MapTask extends Task {
                     // spill finished, reclaim space
                     // need to use meta exclusively; zero-len rec & 100% spill
                     // pcnt would fail
-                    resetSpill(); // resetSpill doesn't move bufindex, kvindex
+                    resetSpill(); // resetSpill doesn't move bufindex, kvindex 
                     bufferRemaining = Math.min(
                         distkvi - 2 * METASIZE,
                         softLimit - distanceTo(kvbidx, bufindex)) - len;
@@ -1768,6 +1831,9 @@ public class MapTask extends Task {
       }
     }
 
+    /**
+     * 检查溢写线程是否有异常
+     */
     private void checkSpillException() throws IOException {
       final Throwable lspillException = sortSpillException;
       if (lspillException != null) {
@@ -1785,8 +1851,8 @@ public class MapTask extends Task {
      */
     private void startSpill() {
       assert !spillInProgress; // 调试用的不用理会
-      // 元数据的边界；为什么是(kvindex + NMETA)？因为meta是环形缓冲区逆时针写的，kvindex表示下一个可以写的位置，要定位到meta数据结束的位置就得减去一个单位，逆时针的，就得 + NMETA；取%是因为环形结构
-      kvend = (kvindex + NMETA) % kvmeta.capacity();
+      // 元数据的边界；为什么是(kvindex + NMETA)？因为meta是环形缓冲区逆时针写的，kvindex表示下一个可以写的位置，要定位到meta数据结束的位置就得减去一个单位，逆时针的，就得 + NMETA；取余kvmeta.capacity()是因为kvbuffer是环形数据结构，在边界时得以循环
+      kvend = (kvindex + NMETA) % kvmeta.capacity(); // 例如：kvmeta.capacity()长度是100，kvindex是98，NMETA是4，(98 + 4) % 100，最终等于2，才得以循环
       bufend = bufmark; // 调整bufend位置，溢写数据时，对bufstart~bufend区间的数据进行溢写
       spillInProgress = true; // 溢写数据标记为true
       LOG.info("Spilling map output");
@@ -1796,7 +1862,7 @@ public class MapTask extends Task {
                "); kvend = " + kvend + "(" + (kvend * 4) +
                "); length = " + (distanceTo(kvend, kvstart,
                      kvmeta.capacity()) + 1) + "/" + maxRec);
-      spillReady.signal(); // 通知 spillReady.await();
+      spillReady.signal(); // 通知 spillReady.await()；唤醒溢写操作线程，但此时还没有释放锁
     }
 
     private void sortAndSpill() throws IOException, ClassNotFoundException,
